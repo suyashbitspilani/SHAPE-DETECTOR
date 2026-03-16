@@ -27,6 +27,15 @@ export interface DetectionResult {
   imageHeight: number;
 }
 
+interface BlobData {
+  pixels: Point[];
+  perimeterPixels: Point[];
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
+
 export class ShapeDetector {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
@@ -36,23 +45,53 @@ export class ShapeDetector {
     this.ctx = canvas.getContext("2d")!;
   }
 
-  /**
-   * MAIN ALGORITHM TO IMPLEMENT
-   * Method for detecting shapes in an image
-   * @param imageData - ImageData from canvas
-   * @returns Promise<DetectionResult> - Detection results
-   *
-   * TODO: Implement shape detection algorithm here
-   */
   async detectShapes(imageData: ImageData): Promise<DetectionResult> {
     const startTime = performance.now();
 
-    // TODO: Implement shape detection algorithm
+    const { width, height, data } = imageData;
+    const visited = new Uint8Array(width * height);
     const shapes: DetectedShape[] = [];
 
-    // Placeholder implementation
-    console.log("Shape detection not implemented yet");
-    console.log("Image dimensions:", imageData.width, "x", imageData.height);
+    // Block transparent noise tiles (low alpha) and light background
+    // Noisy background tiles composite to RGB ~217-242, so threshold at 210
+    const isShapePixel = (idx: number) => {
+      const r = data[idx],
+        g = data[idx + 1],
+        b = data[idx + 2],
+        a = data[idx + 3];
+      const isBackground = r > 210 && g > 210 && b > 210;
+      return a > 100 && !isBackground;
+    };
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const pixelIndex = y * width + x;
+
+        if (!visited[pixelIndex] && isShapePixel(pixelIndex * 4)) {
+          const blob = this.extractBlob(
+            x,
+            y,
+            width,
+            height,
+            visited,
+            isShapePixel
+          );
+
+          const boxWidth = blob.maxX - blob.minX + 1;
+          const boxHeight = blob.maxY - blob.minY + 1;
+          const area = blob.pixels.length;
+          const perimeter = blob.perimeterPixels.length;
+
+          // Solidity check: reject thin lines/text (high perimeter vs area)
+          const isSolid = area > perimeter * 1.5;
+
+          if (area > 200 && boxWidth > 15 && boxHeight > 15 && isSolid) {
+            const shape = this.classifyShape(blob, boxWidth, boxHeight);
+            if (shape) shapes.push(shape);
+          }
+        }
+      }
+    }
 
     const processingTime = performance.now() - startTime;
 
@@ -61,6 +100,206 @@ export class ShapeDetector {
       processingTime,
       imageWidth: imageData.width,
       imageHeight: imageData.height,
+    };
+  }
+
+  private extractBlob(
+    startX: number,
+    startY: number,
+    width: number,
+    height: number,
+    visited: Uint8Array,
+    isShapePixel: (idx: number) => boolean
+  ): BlobData {
+    const queue = [{ x: startX, y: startY }];
+    visited[startY * width + startX] = 1;
+
+    const blob: BlobData = {
+      pixels: [],
+      perimeterPixels: [],
+      minX: startX,
+      maxX: startX,
+      minY: startY,
+      maxY: startY,
+    };
+
+    let head = 0;
+    while (head < queue.length) {
+      const { x, y } = queue[head++];
+      blob.pixels.push({ x, y });
+
+      if (x < blob.minX) blob.minX = x;
+      if (x > blob.maxX) blob.maxX = x;
+      if (y < blob.minY) blob.minY = y;
+      if (y > blob.maxY) blob.maxY = y;
+
+      const neighbors = [
+        { dx: 0, dy: -1 },
+        { dx: 0, dy: 1 },
+        { dx: -1, dy: 0 },
+        { dx: 1, dy: 0 },
+      ];
+      let isEdge = false;
+
+      for (const { dx, dy } of neighbors) {
+        const nx = x + dx,
+          ny = y + dy;
+        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+          const nIdx = ny * width + nx;
+          if (isShapePixel(nIdx * 4)) {
+            if (!visited[nIdx]) {
+              visited[nIdx] = 1;
+              queue.push({ x: nx, y: ny });
+            }
+          } else {
+            isEdge = true;
+          }
+        } else {
+          isEdge = true;
+        }
+      }
+      if (isEdge) blob.perimeterPixels.push({ x, y });
+    }
+    return blob;
+  }
+
+  private countVertices(
+    perimeterPixels: Point[],
+    centerX: number,
+    centerY: number
+  ): number {
+    if (perimeterPixels.length === 0) return 0;
+
+    // Build radial distance profile over 360 degrees
+    const profile = new Array(360).fill(0);
+    for (const p of perimeterPixels) {
+      const dx = p.x - centerX;
+      const dy = p.y - centerY;
+      const angle =
+        Math.floor((Math.atan2(dy, dx) * 180) / Math.PI + 360) % 360;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      profile[angle] = Math.max(profile[angle], dist);
+    }
+
+    // Forward-fill empty buckets
+    for (let i = 0; i < 360; i++) {
+      if (profile[i] === 0) profile[i] = profile[(i - 1 + 360) % 360];
+    }
+
+    // Smooth with sliding window to remove pixel noise
+    const smoothed = new Array(360).fill(0);
+    const halfWin = 7;
+    const winSize = halfWin * 2 + 1;
+    for (let i = 0; i < 360; i++) {
+      let sum = 0;
+      for (let j = -halfWin; j <= halfWin; j++) {
+        sum += profile[(i + j + 360) % 360];
+      }
+      smoothed[i] = sum / winSize;
+    }
+
+    // Count local maxima (peaks) with ±15° neighborhood
+    let peaks = 0;
+    const peakAngles: number[] = [];
+
+    for (let i = 0; i < 360; i++) {
+      const current = smoothed[i];
+      let isPeak = true;
+
+      for (let j = -15; j <= 15; j++) {
+        if (j === 0) continue;
+        if (smoothed[(i + j + 360) % 360] > current) {
+          isPeak = false;
+          break;
+        }
+      }
+
+      if (isPeak) {
+        const lastAngle = peakAngles[peakAngles.length - 1];
+        if (
+          lastAngle === undefined ||
+          Math.min(Math.abs(i - lastAngle), 360 - Math.abs(i - lastAngle)) > 20
+        ) {
+          peaks++;
+          peakAngles.push(i);
+        }
+      }
+    }
+    return peaks;
+  }
+
+  private classifyShape(
+    blob: BlobData,
+    boxWidth: number,
+    boxHeight: number
+  ): DetectedShape | null {
+    const area = blob.pixels.length;
+    const perimeter = blob.perimeterPixels.length;
+
+    let sumX = 0,
+      sumY = 0;
+    for (const p of blob.pixels) {
+      sumX += p.x;
+      sumY += p.y;
+    }
+    const centerX = sumX / area;
+    const centerY = sumY / area;
+
+    const circularity = (4 * Math.PI * area) / (perimeter * perimeter);
+    const vertices = this.countVertices(
+      blob.perimeterPixels,
+      centerX,
+      centerY
+    );
+
+    let type: "circle" | "rectangle" | "triangle" | "pentagon" | "star" =
+      "circle";
+    let confidence = 0.9;
+
+    if (vertices === 3) {
+      type = "triangle";
+      confidence = 0.92;
+    } else if (vertices === 4) {
+      type = "rectangle";
+      confidence = 0.95;
+    } else if (vertices === 5) {
+      // Star vs pentagon: stars have very low circularity (concave indentations)
+      if (circularity < 0.5) {
+        type = "star";
+        confidence = 0.88;
+      } else {
+        type = "pentagon";
+        confidence = 0.85;
+      }
+    } else if (vertices === 10) {
+      // 10 peaks = 5 outer + 5 inner tips of a star
+      type = "star";
+      confidence = 0.9;
+    } else {
+      // Fallback for circles or noisy vertex counts
+      if (circularity >= 0.78) {
+        type = "circle";
+        confidence = circularity;
+      } else if (circularity < 0.4) {
+        type = "star";
+        confidence = 0.8;
+      } else {
+        type = "pentagon";
+        confidence = 0.6;
+      }
+    }
+
+    return {
+      type,
+      center: { x: centerX, y: centerY },
+      boundingBox: {
+        x: blob.minX,
+        y: blob.minY,
+        width: boxWidth,
+        height: boxHeight,
+      },
+      area: area,
+      confidence: Math.min(Math.max(confidence, 0.1), 1.0),
     };
   }
 
